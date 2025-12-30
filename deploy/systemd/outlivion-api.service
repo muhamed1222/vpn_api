@@ -1,0 +1,20 @@
+[Unit]
+Description=Outlivion API Service
+After=network.target
+
+[Service]
+Type=simple
+User=outlivion
+Group=outlivion
+WorkingDirectory=/opt/outlivion-api
+EnvironmentFile=/opt/outlivion-api/.env
+ExecStart=/usr/bin/node /opt/outlivion-api/dist/server.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=outlivion-api
+
+[Install]
+WantedBy=multi-user.target
+
