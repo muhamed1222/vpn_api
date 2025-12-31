@@ -28,9 +28,12 @@ export async function authRoutes(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
+      fastify.log.info('[auth/telegram] Received auth request');
+      
       // Валидация через zod
       const validationResult = telegramAuthSchema.safeParse(request.body);
       if (!validationResult.success) {
+        fastify.log.warn({ errors: validationResult.error.errors }, '[auth/telegram] Validation failed');
         return reply.status(400).send({
           error: 'Validation failed',
           details: validationResult.error.errors,
@@ -38,17 +41,18 @@ export async function authRoutes(fastify: FastifyInstance) {
       }
 
       const { initData } = validationResult.data;
+      fastify.log.debug({ initDataLength: initData.length }, '[auth/telegram] Received initData');
 
       // Проверяем initData
       const verifyResult = verifyTelegramInitData({
         initData,
-        botToken,
+        botToken: botToken || 'MISSING_TOKEN',
         maxAgeSeconds: 86400, // 24 часа
       });
 
       if (!verifyResult.valid || !verifyResult.user) {
         fastify.log.warn(
-          { error: verifyResult.error },
+          { error: verifyResult.error, botTokenExists: !!botToken },
           'Telegram initData verification failed'
         );
         return reply.status(401).send({
@@ -56,6 +60,8 @@ export async function authRoutes(fastify: FastifyInstance) {
           message: verifyResult.error || 'Invalid initData',
         });
       }
+
+      fastify.log.info({ userId: verifyResult.user.id }, '[auth/telegram] Verification successful');
 
       const user = verifyResult.user;
 

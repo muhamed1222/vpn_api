@@ -19,9 +19,10 @@ const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY || '';
 const YOOKASSA_RETURN_URL = process.env.YOOKASSA_RETURN_URL || 'https://my.outlivion.space/pay/return';
 const YOOKASSA_WEBHOOK_IP_CHECK = process.env.YOOKASSA_WEBHOOK_IP_CHECK === 'true';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://api.outlivion.space';
+// Разрешенные origin для CORS (можно переопределить через env, но по умолчанию только нужные домены)
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map((origin) => origin.trim())
-  : [];
+  : ['https://my.outlivion.space', 'https://outlivion.space'];
 
 // Telegram auth настройки
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -109,18 +110,20 @@ const start = async () => {
     });
 
     // Настройка CORS
-    if (ALLOWED_ORIGINS.length > 0) {
-      await fastify.register(cors, {
-        origin: (origin, callback) => {
-          if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-            callback(null, true);
-          } else {
-            callback(new Error('Not allowed by CORS'), false);
-          }
-        },
-        credentials: true, // Разрешаем отправку cookies
-      });
-    }
+    await fastify.register(cors, {
+      origin: (origin, callback) => {
+        // Для запросов с credentials: true origin должен быть явно указан и в списке разрешенных
+        // Разрешаем только явно указанные origin из ALLOWED_ORIGINS
+        if (origin && ALLOWED_ORIGINS.includes(origin)) {
+          callback(null, true);
+        } else {
+          // Для запросов без origin (например, не из браузера) отклоняем
+          callback(new Error('Not allowed by CORS'), false);
+        }
+      },
+      credentials: true, // Разрешаем отправку cookies (withCredentials: true на фронтенде)
+      allowedHeaders: ['Content-Type', 'Authorization'], // Разрешенные заголовки
+    });
 
     // Регистрируем роуты (rate-limit настроен внутри v1Routes)
     await registerRoutes(fastify);
