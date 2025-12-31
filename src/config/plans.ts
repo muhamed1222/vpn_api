@@ -1,5 +1,9 @@
 // Конфигурация планов и их цен
 export const PLAN_PRICES: Record<string, { value: string; currency: string }> = {
+  'test-10': {
+    value: '10.00',
+    currency: 'RUB',
+  },
   'month': {
     value: '299.00',
     currency: 'RUB',
