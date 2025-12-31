@@ -8,6 +8,8 @@ export interface YooKassaReceiptItem {
     currency: string;
   };
   vat_code: number;
+  payment_subject?: string; // 'commodity' | 'service' | 'payment' | 'agent_commission' | 'gambling_bet' | 'gambling_prize' | 'lottery' | 'lottery_prize' | 'intellectual_activity' | 'payment' | 'agent_commission' | 'composite' | 'another'
+  payment_mode?: string; // 'full_prepayment' | 'partial_prepayment' | 'advance' | 'full_payment' | 'partial_payment' | 'credit' | 'credit_payment'
 }
 
 export interface YooKassaReceipt {
