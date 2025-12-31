@@ -1,8 +1,10 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { OrderStore } from '../../store/order-store.js';
 import { CreateOrderRequest, CreateOrderResponse, GetOrderResponse } from '../../types/order.js';
+import { YooKassaClient } from '../../integrations/yookassa/client.js';
 import { v4 as uuidv4 } from 'uuid';
+import { getPlanPrice } from '../../config/plans.js';
+import * as ordersRepo from '../../storage/ordersRepo.js';
 
 const createOrderSchema = z.object({
   planId: z.string().min(1),
@@ -10,7 +12,8 @@ const createOrderSchema = z.object({
 });
 
 export async function ordersRoutes(fastify: FastifyInstance) {
-  const orderStore: OrderStore = fastify.orderStore;
+  const yookassaClient: YooKassaClient = fastify.yookassaClient;
+  const yookassaReturnUrl: string = fastify.yookassaReturnUrl;
 
   // POST /v1/orders/create
   fastify.post<{ Body: CreateOrderRequest }>(
@@ -39,22 +42,78 @@ export async function ordersRoutes(fastify: FastifyInstance) {
 
       const { planId, userRef } = validationResult.data;
       const orderId = uuidv4();
+      const idempotenceKey = uuidv4(); // Уникальный ключ для каждого запроса
 
-      await orderStore.create({
-        orderId,
-        planId,
-        userRef,
-        status: 'pending',
-        createdAt: new Date(),
-      });
+      // Определяем сумму по planId
+      const amount = getPlanPrice(planId);
 
-      const response: CreateOrderResponse = {
-        orderId,
-        status: 'pending',
-        paymentUrl: `https://example.com/pay/${orderId}`,
-      };
+      try {
+        // Сначала создаем заказ в БД со статусом pending
+        ordersRepo.createOrder({
+          orderId,
+          planId,
+          userRef,
+        });
 
-      return reply.status(201).send(response);
+        // Создаем платеж в YooKassa
+        const payment = await yookassaClient.createPayment(
+          {
+            amount: {
+              value: amount.value,
+              currency: amount.currency,
+            },
+            capture: true,
+            confirmation: {
+              type: 'redirect',
+              return_url: yookassaReturnUrl,
+            },
+            description: `Outlivion plan ${planId}, order ${orderId}`,
+            metadata: {
+              orderId,
+              ...(userRef ? { userRef } : {}),
+              planId,
+            },
+          },
+          idempotenceKey
+        );
+
+        // Сохраняем yookassa_payment_id в заказ
+        ordersRepo.setPaymentId({
+          orderId,
+          yookassaPaymentId: payment.id,
+          amountValue: payment.amount.value,
+          amountCurrency: payment.amount.currency,
+        });
+
+        const response: CreateOrderResponse = {
+          orderId,
+          status: 'pending',
+          paymentUrl: payment.confirmation.confirmation_url,
+        };
+
+        return reply.status(201).send(response);
+      } catch (error) {
+        // Если YooKassa createPayment упал, заказ остается pending
+        fastify.log.error(
+          {
+            err: error,
+            orderId,
+            planId,
+            userRef,
+          },
+          'Failed to create YooKassa payment'
+        );
+
+        // Логируем детали без секретов
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const sanitizedError = errorMessage.replace(/SHOP_ID|SECRET_KEY|Authorization/g, '[REDACTED]');
+
+        return reply.status(500).send({
+          error: 'Failed to create payment',
+          message: 'Payment service temporarily unavailable. Order created but payment link could not be generated.',
+          details: sanitizedError,
+        });
+      }
     }
   );
 
@@ -75,17 +134,17 @@ export async function ordersRoutes(fastify: FastifyInstance) {
     async (request, reply) => {
       const { orderId } = request.params;
 
-      const order = await orderStore.findById(orderId);
-      if (!order) {
+      const orderRow = ordersRepo.getOrder(orderId);
+      if (!orderRow) {
         return reply.status(404).send({
           error: 'Order not found',
         });
       }
 
       const response: GetOrderResponse = {
-        orderId: order.orderId,
-        status: order.status,
-        ...(order.status === 'paid' && order.key ? { key: order.key } : {}),
+        orderId: orderRow.order_id,
+        status: orderRow.status === 'paid' ? 'paid' : 'pending',
+        ...(orderRow.status === 'paid' && orderRow.key ? { key: orderRow.key } : {}),
       };
 
       return reply.send(response);

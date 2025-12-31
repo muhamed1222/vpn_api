@@ -16,10 +16,23 @@ npm install
 cp .env.example .env
 ```
 
+**На VPS:** Создайте директорию для базы данных перед запуском:
+
+```bash
+sudo mkdir -p /opt/outlivion-api/data
+sudo chown outlivion:outlivion /opt/outlivion-api/data
+```
+
 Переменные окружения:
 - `HOST=127.0.0.1` - адрес, на котором сервер будет слушать (по умолчанию `127.0.0.1`)
 - `PORT=3001` - порт сервера (по умолчанию `3001`)
-- `ALLOWED_ORIGINS=https://outlivion.space,https://www.outlivion.space` - разрешенные источники для CORS (через запятую, опционально)
+- `DATABASE_PATH=/opt/outlivion-api/data/db.sqlite` - путь к файлу SQLite базы данных
+- `YOOKASSA_SHOP_ID` - ID магазина YooKassa (обязательно)
+- `YOOKASSA_SECRET_KEY` - секретный ключ YooKassa (обязательно)
+- `YOOKASSA_RETURN_URL=https://my.outlivion.space/pay/return` - URL для возврата пользователя после оплаты
+- `YOOKASSA_WEBHOOK_IP_CHECK=false` - включить проверку IP для webhook (по умолчанию `false`)
+- `PUBLIC_BASE_URL=https://api.outlivion.space` - публичный URL API (для генерации webhook URL и ссылок)
+- `ALLOWED_ORIGINS=https://outlivion.space,https://www.outlivion.space,https://my.outlivion.space` - разрешенные источники для CORS (через запятую, опционально)
 
 **Важно:** Сервер слушает именно указанный `HOST`, а не `0.0.0.0`. По умолчанию это `127.0.0.1` (только localhost).
 
@@ -122,23 +135,66 @@ curl http://127.0.0.1:3001/v1/orders/550e8400-e29b-41d4-a716-446655440000
 
 #### POST /v1/payments/webhook
 
-Webhook для обработки событий платежей.
+Webhook для обработки уведомлений YooKassa.
 
-```bash
-curl -X POST http://127.0.0.1:3001/v1/payments/webhook \
-  -H "Content-Type: application/json" \
-  -d '{
-    "event": "payment.succeeded",
-    "orderId": "550e8400-e29b-41d4-a716-446655440000"
-  }'
+**Формат уведомления YooKassa:**
+```json
+{
+  "type": "notification",
+  "event": "payment.succeeded",
+  "object": {
+    "id": "2c5e8b3a-000f-5000-8000-1a2b3c4d5e6f",
+    "status": "succeeded",
+    "paid": true,
+    "amount": {
+      "value": "299.00",
+      "currency": "RUB"
+    },
+    "metadata": {
+      "orderId": "550e8400-e29b-41d4-a716-446655440000",
+      "planId": "plan-basic",
+      "userRef": "user-123"
+    }
+  }
+}
 ```
 
-Ответ:
+**Тестовый пример (мок уведомления):**
+```bash
+ORDER_ID="550e8400-e29b-41d4-a716-446655440000"
+PAYMENT_ID="2c5e8b3a-000f-5000-8000-1a2b3c4d5e6f"
+
+curl -X POST http://127.0.0.1:3001/v1/payments/webhook \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"type\": \"notification\",
+    \"event\": \"payment.succeeded\",
+    \"object\": {
+      \"id\": \"$PAYMENT_ID\",
+      \"status\": \"succeeded\",
+      \"paid\": true,
+      \"amount\": {
+        \"value\": \"299.00\",
+        \"currency\": \"RUB\"
+      },
+      \"metadata\": {
+        \"orderId\": \"$ORDER_ID\",
+        \"planId\": \"plan-basic\"
+      }
+    }
+  }"
+```
+
+**Ответ:**
 ```json
 {
   "ok": true
 }
 ```
+
+**Обрабатываемые события:**
+- `payment.succeeded` — заказ помечается как оплачен, создается VPN ключ
+- `payment.canceled` — заказ помечается как отменен (если еще не оплачен)
 
 ## Примеры использования
 

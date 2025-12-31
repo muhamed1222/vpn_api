@@ -2,32 +2,58 @@ import Fastify from 'fastify';
 import dotenv from 'dotenv';
 import cors from '@fastify/cors';
 import { registerRoutes } from './routes/index.js';
-import { MemoryOrderStore } from './store/memory-order-store.js';
+import { SqliteOrderStore } from './store/sqlite-order-store.js';
 import { OrderStore } from './store/order-store.js';
+import { initDatabase, closeDatabase } from './storage/db.js';
+import { YooKassaClient } from './integrations/yookassa/client.js';
 
 // Загружаем переменные окружения
 dotenv.config();
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = parseInt(process.env.PORT || '3001', 10);
+const DATABASE_PATH = process.env.DATABASE_PATH || './data/db.sqlite';
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID || '';
+const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY || '';
+const YOOKASSA_RETURN_URL = process.env.YOOKASSA_RETURN_URL || 'https://my.outlivion.space/pay/return';
+const YOOKASSA_WEBHOOK_IP_CHECK = process.env.YOOKASSA_WEBHOOK_IP_CHECK === 'true';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://api.outlivion.space';
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map((origin) => origin.trim())
   : [];
 
 const fastify = Fastify({
   logger: true,
+  trustProxy: true, // Для корректного определения real IP за nginx
 });
 
-// Расширяем типы Fastify для orderStore
+// Расширяем типы Fastify для orderStore и yookassaClient
 declare module 'fastify' {
   interface FastifyInstance {
     orderStore: OrderStore;
+    yookassaClient: YooKassaClient;
+    yookassaReturnUrl: string;
+    yookassaWebhookIPCheck: boolean;
+    publicBaseUrl: string;
   }
 }
 
+// Инициализируем базу данных
+initDatabase(DATABASE_PATH);
+
 // Инициализируем хранилище заказов
-const orderStore = new MemoryOrderStore();
+const orderStore = new SqliteOrderStore();
 fastify.decorate('orderStore', orderStore);
+
+// Инициализируем YooKassa клиент
+const yookassaClient = new YooKassaClient({
+  shopId: YOOKASSA_SHOP_ID,
+  secretKey: YOOKASSA_SECRET_KEY,
+});
+fastify.decorate('yookassaClient', yookassaClient);
+fastify.decorate('yookassaReturnUrl', YOOKASSA_RETURN_URL);
+fastify.decorate('yookassaWebhookIPCheck', YOOKASSA_WEBHOOK_IP_CHECK);
+fastify.decorate('publicBaseUrl', PUBLIC_BASE_URL);
 
 
 // Обработка ошибок
@@ -45,10 +71,12 @@ const gracefulShutdown = async (signal: string) => {
   
   try {
     await fastify.close();
+    closeDatabase();
     fastify.log.info('Server closed successfully');
     process.exit(0);
   } catch (error) {
     fastify.log.error({ err: error }, 'Error during shutdown');
+    closeDatabase();
     process.exit(1);
   }
 };

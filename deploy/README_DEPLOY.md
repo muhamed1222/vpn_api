@@ -54,7 +54,20 @@ sudo -u outlivion npm run build
 ls -la dist/
 ```
 
-## Шаг 3: Настройка переменных окружения
+## Шаг 3: Создание директории для базы данных
+
+```bash
+# Создаем директорию для базы данных
+sudo mkdir -p /opt/outlivion-api/data
+
+# Устанавливаем владельца
+sudo chown outlivion:outlivion /opt/outlivion-api/data
+
+# Устанавливаем права доступа
+sudo chmod 755 /opt/outlivion-api/data
+```
+
+## Шаг 4: Настройка переменных окружения
 
 ```bash
 cd /opt/outlivion-api
@@ -70,6 +83,11 @@ sudo chmod 600 .env
 sudo chown outlivion:outlivion .env
 ```
 
+**Важно:** Убедитесь, что в `.env` указан правильный путь к базе данных:
+```env
+DATABASE_PATH=/opt/outlivion-api/data/db.sqlite
+```
+
 Пример `.env`:
 ```env
 HOST=127.0.0.1
@@ -81,7 +99,7 @@ ALLOWED_ORIGINS=https://outlivion.space,https://www.outlivion.space
 - Убедитесь, что порт 3001 не занят другими сервисами
 - Файл `.env` должен быть доступен только пользователю `outlivion` (chmod 600)
 
-## Шаг 4: Настройка systemd сервиса
+## Шаг 5: Настройка systemd сервиса
 
 ```bash
 # Копируем systemd unit файл
@@ -112,7 +130,7 @@ sudo journalctl -u outlivion-api -n 50
 - Права доступа к файлам
 - Содержимое `.env` файла
 
-## Шаг 5: Настройка nginx
+## Шаг 6: Настройка nginx
 
 **Важно:** Этот конфиг создается как отдельный файл и НЕ затрагивает существующий `vpn.outlivion.space`.
 
@@ -134,7 +152,7 @@ sudo systemctl reload nginx
 - Убедитесь, что домен `api.outlivion.space` указывает на IP вашего VPS (A-запись в DNS)
 - Проверьте, что существующий конфиг `vpn.outlivion.space` не будет затронут
 
-## Шаг 6: Настройка SSL (HTTPS) через certbot
+## Шаг 7: Настройка SSL (HTTPS) через certbot
 
 ```bash
 # Устанавливаем SSL сертификат для api.outlivion.space
@@ -151,7 +169,7 @@ sudo systemctl reload nginx
 - Настроит автоматическое перенаправление с HTTP на HTTPS
 - Настроит автообновление сертификата
 
-## Шаг 7: Проверка работы
+## Шаг 8: Проверка работы
 
 ### Проверка systemd сервиса:
 ```bash
