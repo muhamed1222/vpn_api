@@ -125,6 +125,29 @@ export async function authRoutes(fastify: FastifyInstance) {
       });
     }
   );
+
+  /**
+   * GET /v1/auth/me
+   * Проверка текущей сессии по cookie
+   */
+  const { createVerifyAuth } = await import('../../auth/verifyAuth.js');
+  const verifyAuth = createVerifyAuth({ jwtSecret, cookieName });
+
+  fastify.get(
+    '/me',
+    {
+      preHandler: verifyAuth,
+    },
+    async (request, reply) => {
+      if (!request.user) {
+        return reply.status(401).send({ error: 'Unauthorized' });
+      }
+      return reply.send({
+        ok: true,
+        user: request.user,
+      });
+    }
+  );
 }
 
 

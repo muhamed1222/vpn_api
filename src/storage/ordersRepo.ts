@@ -201,3 +201,14 @@ export function getOrdersByUser(userRef: string): OrderRow[] {
   `).all(userRef) as OrderRow[];
 }
 
+export function getLastKeyForUser(userRef: string): string | null {
+  const db = getDatabase();
+  const row = db.prepare(`
+    SELECT key FROM orders 
+    WHERE user_ref = ? AND status = 'paid' AND key IS NOT NULL AND key != ''
+    ORDER BY updated_at DESC 
+    LIMIT 1
+  `).get(userRef) as { key: string } | undefined;
+  return row ? row.key : null;
+}
+

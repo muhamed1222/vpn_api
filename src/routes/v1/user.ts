@@ -13,11 +13,30 @@ export async function userRoutes(fastify: FastifyInstance) {
 
   /**
    * GET /v1/user/config
+   * Берет "замороженную" ссылку из последнего оплаченного заказа.
+   * Это предотвращает прыгание ссылок из-за особенностей Marzban.
    */
   fastify.get('/config', { preHandler: verifyAuth }, async (request, reply) => {
     if (!request.user) return reply.status(401).send({ error: 'Unauthorized' });
-    const config = await marzbanService.getUserConfig(request.user.tgId);
-    if (!config) return reply.status(404).send({ error: 'Not Found' });
+    
+    const { getLastKeyForUser } = await import('../../storage/ordersRepo.js');
+    const userRef = `tg_${request.user.tgId}`;
+    
+    // 1. Сначала пробуем взять из нашей базы (это стабильно)
+    let config = getLastKeyForUser(userRef);
+    
+    // 2. Если в базе нет (например, старый юзер или сбой), тянем из Marzban и сохраняем
+    if (!config) {
+      config = await marzbanService.getUserConfig(request.user.tgId);
+    }
+    
+    if (!config) {
+      return reply.status(404).send({ 
+        error: 'Not Found', 
+        message: 'У вас еще нет активной подписки.' 
+      });
+    }
+    
     return reply.send({ ok: true, config });
   });
 
@@ -41,7 +60,22 @@ export async function userRoutes(fastify: FastifyInstance) {
    */
   fastify.post('/regenerate', { preHandler: verifyAuth }, async (request, reply) => {
     if (!request.user) return reply.status(401).send({ error: 'Unauthorized' });
+    
+    // 1. Генерируем новый в Marzban
     const config = await marzbanService.regenerateUser(request.user.tgId);
+    
+    // 2. "Замораживаем" новый ключ в последнем заказе, чтобы он не прыгал
+    if (config) {
+      const { getOrdersByUser, markPaidWithKey } = await import('../../storage/ordersRepo.js');
+      const userRef = `tg_${request.user.tgId}`;
+      const orders = getOrdersByUser(userRef);
+      const lastPaidOrder = orders.find(o => o.status === 'paid');
+      
+      if (lastPaidOrder) {
+        markPaidWithKey({ orderId: lastPaidOrder.order_id, key: config });
+      }
+    }
+    
     return reply.send({ ok: true, config });
   });
 
