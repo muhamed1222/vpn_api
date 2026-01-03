@@ -7,58 +7,83 @@ export class MarzbanService {
     this.client = new MarzbanClient(apiUrl, username, password);
   }
 
+  private async findUser(tgId: number): Promise<MarzbanUser | null> {
+    const withPrefix = `tg_${tgId}`;
+    const withoutPrefix = tgId.toString();
+    let user = await this.client.getUser(withPrefix);
+    if (user) return user;
+    user = await this.client.getUser(withoutPrefix);
+    return user;
+  }
+
   /**
-   * Получает или создает пользователя и возвращает его конфиг
+   * Универсальная функция активации/продления
    */
-  async getOrCreateUserConfig(tgId: number): Promise<string | null> {
-    try {
-      const username = tgId.toString();
-      let user = await this.client.getUser(username);
+  async activateUser(tgId: number, days: number): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    let user = await this.findUser(tgId);
+    
+    if (!user) {
+      console.log(`[MarzbanService] Creating new user for tg_${tgId}`);
+      const expireDate = now + (days * 86400);
       
-      if (!user) {
-        console.log(`[MarzbanService] User ${username} not found, creating...`);
-        const serverName = `🇳🇱 Нидерланды [VLESS - tcp]`;
-        
-        user = await this.client.createUser({
-          username: username,
-          proxies: { vless: {} },
-          inbounds: { vless: ["VLESS_REALITY"] },
-          expire: 0,
-          data_limit: 0,
-          status: 'active',
-          remark: serverName,
-          note: serverName
-        });
-      }
+      user = await this.client.createUser({
+        username: `tg_${tgId}`,
+        proxies: { vless: {} },
+        inbounds: { vless: ["VLESS_REALITY"] },
+        expire: expireDate,
+        data_limit: 0,
+        status: 'active',
+        note: `🇳🇱 Нидерланды [VLESS - tcp]`
+      });
+    } else {
+      console.log(`[MarzbanService] Renewing existing user ${user.username}`);
+      const currentExpire = (user.expire && user.expire > now) ? user.expire : now;
+      const newExpire = currentExpire + (days * 86400);
 
-      if (!user) return null;
-
-      // ЛОГИКА ПОЛУЧЕНИЯ ССЫЛКИ:
-      // 1. Приоритет - ссылка на подписку (Subscription URL), так как она универсальна
-      if (user.subscription_url) {
-        // Превращаем /sub/... в https://vpn.outlivion.space/bot-api/sub/...
-        // Мы используем /bot-api/ префикс, так как он проксируется через nginx к Marzban
-        return `https://vpn.outlivion.space/bot-api${user.subscription_url}`;
-      }
-
-      // 2. Если нет подписки, берем первую прямую ссылку (vless://...)
-      if (user.links && user.links.length > 0) {
-        return user.links[0];
-      }
-
-      return null;
-    } catch (error: any) {
-      console.error(`[MarzbanService] Error getting/creating config for ${tgId}:`, error.response?.data || error.message);
-      return null;
+      user = await this.client.updateUser(user.username, {
+        ...user,
+        expire: newExpire,
+        status: 'active'
+      });
     }
+
+    if (!user) throw new Error('Failed to create or update user in Marzban');
+
+    // Формируем ссылку на подписку
+    const subUrl = user.subscription_url 
+      ? `https://vpn.outlivion.space/bot-api${user.subscription_url}`
+      : (user.links?.[0] || '');
+      
+    if (!subUrl) throw new Error('Marzban returned user without any links or sub_url');
+    
+    return subUrl;
   }
 
   async getUserConfig(tgId: number): Promise<string | null> {
-    return this.getOrCreateUserConfig(tgId);
+    const user = await this.findUser(tgId);
+    if (!user) return null;
+    return user.subscription_url 
+      ? `https://vpn.outlivion.space/bot-api${user.subscription_url}`
+      : (user.links?.[0] || null);
   }
 
   async getUserStatus(tgId: number): Promise<MarzbanUser | null> {
-    const username = tgId.toString();
-    return await this.client.getUser(username);
+    return await this.findUser(tgId);
+  }
+
+  async renewUser(tgId: number, days: number): Promise<boolean> {
+    await this.activateUser(tgId, days);
+    return true;
+  }
+
+  async regenerateUser(tgId: number): Promise<string | null> {
+    const user = await this.findUser(tgId);
+    if (!user) return null;
+    await this.client.request({
+      method: 'post',
+      url: `/api/user/${user.username}/reset`,
+    });
+    return await this.getUserConfig(tgId);
   }
 }

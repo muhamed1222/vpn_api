@@ -5,6 +5,7 @@ export interface MarzbanUser {
   status: string;
   expire: number | null;
   data_limit: number | null;
+  used_traffic: number;
   subscription_url: string;
   links: string[];
   remark?: string;
@@ -44,7 +45,10 @@ export class MarzbanClient {
     }
   }
 
-  private async request(config: any): Promise<any> {
+  /**
+   * Сделано публичным для использования в сервисах
+   */
+  public async request(config: any): Promise<any> {
     if (!this.token) {
       await this.login();
     }

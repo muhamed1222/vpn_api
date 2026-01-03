@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import axios from 'axios';
 import * as ordersRepo from '../../storage/ordersRepo.js';
-import { isYooKassaIP } from '../../config/yookassa.js';
 
 const yookassaWebhookSchema = z.object({
   type: z.literal('notification'),
@@ -10,131 +10,87 @@ const yookassaWebhookSchema = z.object({
     id: z.string(),
     status: z.string(),
     paid: z.boolean(),
-    amount: z.object({
-      value: z.string(),
-      currency: z.string(),
-    }).optional(),
-    metadata: z.object({
-      orderId: z.string(),
-      userRef: z.string().optional(),
-      planId: z.string().optional(),
-    }).optional(),
+    metadata: z.object({ orderId: z.string() }).optional(),
   }),
 });
 
 export async function paymentsRoutes(fastify: FastifyInstance) {
-  const webhookIPCheck: boolean = fastify.yookassaWebhookIPCheck;
   const marzbanService = fastify.marzbanService;
+  const botToken = fastify.telegramBotToken;
 
-  // POST /v1/payments/webhook
   fastify.post<{ Body: unknown }>(
     '/webhook',
-    {
-      schema: {
-        body: {
-          type: 'object',
-        },
-      },
-    },
     async (request, reply) => {
-      // Проверка IP (если включена)
-      if (webhookIPCheck) {
-        const clientIP = request.ip || '';
-        if (!clientIP || !isYooKassaIP(clientIP)) {
-          fastify.log.warn({ ip: clientIP, headers: request.headers }, 'Webhook request from unauthorized IP');
-          return reply.status(403).send({ error: 'Forbidden' });
-        }
-      }
-
-      // Валидация через zod
       const validationResult = yookassaWebhookSchema.safeParse(request.body);
       if (!validationResult.success) {
-        fastify.log.warn({ body: request.body, errors: validationResult.error.errors }, 'Invalid webhook payload');
-        return reply.status(400).send({
-          error: 'Validation failed',
-          details: validationResult.error.errors,
-        });
+        return reply.status(200).send({ ok: true });
       }
 
       const { event, object } = validationResult.data;
-      const paymentId = object.id;
-
-      // Извлекаем orderId из metadata или ищем по payment_id
-      let orderId: string | null = null;
-      if (object.metadata?.orderId) {
-        orderId = object.metadata.orderId;
-      } else {
-        const order = ordersRepo.getOrderByPaymentId(paymentId);
-        if (order) {
-          orderId = order.order_id;
-        }
-      }
-
-      if (!orderId) {
-        fastify.log.error({ paymentId }, 'Order not found for payment');
+      if (event !== 'payment.succeeded' || object.status !== 'succeeded') {
         return reply.status(200).send({ ok: true });
       }
+
+      const orderId = object.metadata?.orderId;
+      if (!orderId) return reply.status(200).send({ ok: true });
 
       const orderRow = ordersRepo.getOrder(orderId);
-      if (!orderRow) {
-        fastify.log.error({ orderId, paymentId }, 'Order not found in database');
+      if (!orderRow || orderRow.status === 'paid') {
         return reply.status(200).send({ ok: true });
       }
 
-      // Обработка payment.succeeded
-      if (event === 'payment.succeeded' && object.status === 'succeeded' && object.paid === true) {
-        if (orderRow.status === 'paid' && orderRow.key) {
-          return reply.status(200).send({ ok: true });
-        }
+      const tgIdStr = orderRow.user_ref?.replace('tg_', '');
+      const tgId = tgIdStr ? parseInt(tgIdStr, 10) : null;
 
-        // Пытаемся получить или создать ключ для пользователя
-        const tgIdStr = orderRow.user_ref?.replace('tg_', '');
-        const tgId = tgIdStr ? parseInt(tgIdStr, 10) : null;
+      if (tgId && !isNaN(tgId)) {
+        try {
+          const planId = orderRow.plan_id;
+          let days = 30;
+          if (planId === 'plan_7') days = 7;
+          else if (planId === 'plan_30') days = 30;
+          else if (planId === 'plan_90') days = 90;
+          else if (planId === 'plan_180') days = 180;
+          else if (planId === 'plan_365') days = 365;
 
-        let key = 'Check your account for VPN key';
-        if (tgId && !isNaN(tgId)) {
-          try {
-            // 1. Сначала создаем пользователя, если его нет
-            const config = await marzbanService.getOrCreateUserConfig(tgId);
-            
-            // 2. Рассчитываем срок на основе planId
-            const planId = orderRow.plan_id;
-            let days = 30; // дефолт
-            if (planId === 'plan_7') days = 7;
-            else if (planId === 'plan_30') days = 30;
-            else if (planId === 'plan_90') days = 90;
-            else if (planId === 'plan_180') days = 180;
-            else if (planId === 'plan_365') days = 365;
+          // ВЫЗЫВАЕМ НОВУЮ УНИВЕРСАЛЬНУЮ ФУНКЦИЮ
+          // Она создаст юзера, если его нет, или продлит существующего
+          const vlessKey = await marzbanService.activateUser(tgId, days);
 
-            const expireTimestamp = Math.floor(Date.now() / 1000) + (days * 86400);
+          // Обновляем статус заказа и сохраняем ключ
+          ordersRepo.markPaidWithKey({ 
+            orderId, 
+            key: vlessKey 
+          });
 
-            // 3. Обновляем срок в Marzban
-            await marzbanService.client.updateUser(tgId.toString(), {
-              expire: expireTimestamp,
-              status: 'active'
+          // Отправляем уведомление пользователю
+          if (botToken) {
+            const expireDate = new Date(Date.now() + (days * 86400 * 1000)).toLocaleDateString('ru-RU');
+            await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+              chat_id: tgId,
+              text: `✅ <b>Оплата получена! Ваша подписка активирована.</b>\n\n` +
+                    `🟢 Статус: <b>Активна</b>\n` +
+                    `🕓 Действует до: <b>${expireDate}</b>\n\n` +
+                    `🔗 <b>Ваш ключ:</b>\n<code>${vlessKey}</code>\n\n` +
+                    `Используйте кнопки в боте для управления подключением.`,
+              parse_mode: 'HTML'
+            }).catch(err => {
+              fastify.log.error({ err: err.message, tgId }, 'Failed to send TG success message');
             });
+          }
 
-            if (config) {
-              key = config;
-            }
-          } catch (e: any) {
-            fastify.log.error({ err: e.message, tgId }, 'Failed to activate/update Marzban');
+          fastify.log.info({ orderId, tgId }, '[Webhook] Successfully activated user and sent notification');
+
+        } catch (e: any) {
+          fastify.log.error({ err: e.message, tgId, orderId }, '[Webhook] CRITICAL ACTIVATION ERROR');
+          
+          // Уведомляем админа о сбое
+          if (botToken) {
+            await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+              chat_id: 7972426786,
+              text: `🚨 <b>ОШИБКА СОЗДАНИЯ КЛЮЧА</b>\nЮзер: ${tgId}\nОшибка: ${e.message}\n\nСрочно проверьте панель Marzban!`
+            }).catch(() => {});
           }
         }
-
-        // Помечаем заказ как paid и сохраняем key
-        ordersRepo.markPaidWithKey({
-          orderId,
-          key: key,
-        });
-
-        fastify.log.info({ orderId, paymentId }, 'Order marked as paid');
-        return reply.status(200).send({ ok: true });
-      }
-
-      if (event === 'payment.canceled') {
-        ordersRepo.markCanceled(orderId);
-        return reply.status(200).send({ ok: true });
       }
 
       return reply.status(200).send({ ok: true });
