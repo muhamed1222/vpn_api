@@ -48,13 +48,14 @@ export function verifyTelegramInitData(
     
     for (const pair of pairs) {
       const [key, rawValue = ''] = pair.split('=');
+      const decodedValue = decodeURIComponent(rawValue);
+      
       if (key === 'hash') {
-        hash = decodeURIComponent(rawValue);
+        hash = decodedValue;
       } else {
-        // Сохраняем оригинальное значение для data_check_string
-        originalParamsMap.set(key, rawValue);
-        // Сохраняем декодированное значение для извлечения данных
-        decodedParamsMap.set(key, decodeURIComponent(rawValue));
+        // ВАЖНО: Для формирования data_check_string используем ДЕКОДИРОВАННЫЕ значения
+        originalParamsMap.set(key, decodedValue);
+        decodedParamsMap.set(key, decodedValue);
       }
     }
 
