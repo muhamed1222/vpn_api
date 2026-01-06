@@ -140,4 +140,27 @@ export async function userRoutes(fastify: FastifyInstance) {
       },
     });
   });
+
+  /**
+   * GET /v1/user/referrals
+   * Статистика реферальной программы
+   */
+  fastify.get('/referrals', { preHandler: verifyAuth }, async (request, reply) => {
+    if (!request.user) return reply.status(401).send({ error: 'Unauthorized' });
+
+    const botDbPath = process.env.BOT_DATABASE_PATH;
+    if (!botDbPath) {
+      return reply.send({
+        totalCount: 0,
+        trialCount: 0,
+        premiumCount: 0,
+        referralCode: `REF${request.user.tgId}`,
+      });
+    }
+
+    const { getReferralStats } = await import('../../storage/referralsRepo.js');
+    const stats = getReferralStats(request.user.tgId, botDbPath);
+    
+    return reply.send(stats);
+  });
 }
