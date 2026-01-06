@@ -3,6 +3,7 @@ import { z } from 'zod';
 import axios from 'axios';
 import * as ordersRepo from '../../storage/ordersRepo.js';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
+import { isYooKassaIP } from '../../config/yookassa.js';
 
 const yookassaWebhookSchema = z.object({
   type: z.literal('notification'),
@@ -20,6 +21,7 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
   const botToken = fastify.telegramBotToken;
   const jwtSecret: string = fastify.authJwtSecret;
   const cookieName: string = fastify.authCookieName;
+  const webhookIpCheck = fastify.yookassaWebhookIPCheck;
 
   const verifyAuth = createVerifyAuth({
     jwtSecret,
@@ -30,6 +32,15 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
   fastify.post<{ Body: unknown }>(
     '/webhook',
     async (request, reply) => {
+      // 1. Проверка IP (если включено в конфиге)
+      if (webhookIpCheck) {
+        const clientIp = request.ip;
+        if (!isYooKassaIP(clientIp)) {
+          fastify.log.warn({ ip: clientIp }, '[Webhook] Rejected request from non-YooKassa IP');
+          return reply.status(403).send({ error: 'Forbidden' });
+        }
+      }
+
       const validationResult = yookassaWebhookSchema.safeParse(request.body);
       if (!validationResult.success) {
         return reply.status(200).send({ ok: true });
