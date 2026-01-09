@@ -119,6 +119,16 @@ export class MarzbanService {
     if (!user) throw new Error('Failed to activate user');
     const url = this.formatSubscriptionUrl(user);
 
+    if (!url) {
+      console.error(`[MarzbanService] formatSubscriptionUrl returned empty for user ${user.username}`);
+      console.error(`[MarzbanService] User data:`, JSON.stringify({
+        subscription_url: user.subscription_url,
+        links: user.links,
+        username: user.username
+      }));
+      throw new Error('Failed to format subscription URL');
+    }
+
     // Обновляем в нашей БД
     keysRepo.saveKey({
       userRef,

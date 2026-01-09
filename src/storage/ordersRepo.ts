@@ -90,11 +90,19 @@ export function markPaidWithKey(params: {
   const db = getDatabase();
   const now = new Date().toISOString();
 
+  if (!params.key || params.key.trim() === '') {
+    console.error(`[ordersRepo] markPaidWithKey: empty key for order ${params.orderId}`);
+    return false;
+  }
+
   // Идемпотентная операция: если уже paid и key есть, ничего не делаем
   const order = getOrder(params.orderId);
-  if (order && order.status === 'paid' && order.key) {
+  if (order && order.status === 'paid' && order.key && order.key.trim() !== '') {
+    console.log(`[ordersRepo] markPaidWithKey: order ${params.orderId} already has key`);
     return true; // Уже обработано
   }
+
+  console.log(`[ordersRepo] markPaidWithKey: saving key for order ${params.orderId}, key length: ${params.key.length}`);
 
   const result = db.prepare(`
     UPDATE orders
@@ -107,6 +115,8 @@ export function markPaidWithKey(params: {
     now,
     params.orderId
   );
+
+  console.log(`[ordersRepo] markPaidWithKey: updated ${result.changes} rows for order ${params.orderId}`);
 
   return result.changes > 0;
 }

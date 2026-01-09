@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { PLAN_PRICES } from '../../config/plans.js';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
 import { getOrdersByUser } from '../../storage/ordersRepo.js';
+import fs from 'fs';
 
 /**
  * Роуты для получения тарифов
@@ -36,7 +37,7 @@ export async function tariffsRoutes(fastify: FastifyInstance) {
     let trialAvailable = true;
 
     // Если пользователь авторизован, проверяем его прошлые заказы
-    if (request.user) {
+    if (request.user && request.user.tgId) {
       const userRef = `tg_${request.user.tgId}`;
       const orders = getOrdersByUser(userRef);
       
@@ -45,11 +46,13 @@ export async function tariffsRoutes(fastify: FastifyInstance) {
       
       if (hasPaidOrders) {
         trialAvailable = false;
+        fastify.log.info({ tgId: request.user.tgId, hasPaidOrders }, '[Tariffs] User has paid orders, hiding plan_7');
       }
 
       // Дополнительная проверка через базу бота (если доступна)
-      const botDbPath = process.env.BOT_DATABASE_PATH;
-      if (trialAvailable && botDbPath) {
+      // Пробуем стандартный путь, если переменная окружения не установлена
+      const botDbPath = process.env.BOT_DATABASE_PATH || '/root/vpn_bot/data/database.sqlite';
+      if (trialAvailable && fs.existsSync(botDbPath)) {
         try {
           const { getDatabase } = await import('../../storage/db.js');
           const db = getDatabase();
@@ -68,6 +71,7 @@ export async function tariffsRoutes(fastify: FastifyInstance) {
             
             if (botPaidOrder) {
               trialAvailable = false;
+              fastify.log.info({ tgId: request.user.tgId }, '[Tariffs] User has paid orders in bot DB, hiding plan_7');
             }
             
             db.prepare('DETACH DATABASE bot_db').run();
@@ -79,6 +83,10 @@ export async function tariffsRoutes(fastify: FastifyInstance) {
           fastify.log.error({ err: e }, 'Error checking trial availability in bot database');
         }
       }
+    } else {
+      // Если пользователь не авторизован, показываем все тарифы (включая пробный)
+      // Это нормально для первого визита
+      fastify.log.debug('[Tariffs] User not authenticated, showing all plans including trial');
     }
 
     // Преобразуем PLAN_PRICES в формат для фронтенда

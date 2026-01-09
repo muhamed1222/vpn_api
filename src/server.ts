@@ -67,6 +67,12 @@ initDatabase(DATABASE_PATH);
 const orderStore = new SqliteOrderStore();
 fastify.decorate('orderStore', orderStore);
 
+// Валидация YooKassa credentials
+if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
+  console.error('❌ ОШИБКА: YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY должны быть установлены в .env');
+  process.exit(1);
+}
+
 // Инициализируем YooKassa клиент
 const yookassaClient = new YooKassaClient({
   shopId: YOOKASSA_SHOP_ID,

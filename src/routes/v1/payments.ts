@@ -55,8 +55,29 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
       if (!orderId) return reply.status(200).send({ ok: true });
 
       const orderRow = ordersRepo.getOrder(orderId);
-      if (!orderRow || orderRow.status === 'paid') {
+      if (!orderRow) {
+        fastify.log.warn({ orderId }, '[Webhook] Order not found');
         return reply.status(200).send({ ok: true });
+      }
+      
+      fastify.log.info({ 
+        orderId, 
+        status: orderRow.status, 
+        keyType: typeof orderRow.key,
+        keyValue: orderRow.key ? orderRow.key.substring(0, 50) : 'null/empty',
+        keyLength: orderRow.key ? orderRow.key.length : 0
+      }, '[Webhook] Order found, checking status');
+      
+      // Если ордер уже paid И ключ есть - пропускаем
+      const hasValidKey = orderRow.key && typeof orderRow.key === 'string' && orderRow.key.trim() !== '';
+      if (orderRow.status === 'paid' && hasValidKey) {
+        fastify.log.info({ orderId, hasKey: true }, '[Webhook] Order already processed with key');
+        return reply.status(200).send({ ok: true });
+      }
+      
+      // Если ордер paid, но ключа нет - активируем
+      if (orderRow.status === 'paid' && !hasValidKey) {
+        fastify.log.warn({ orderId, status: orderRow.status, hasKey: false }, '[Webhook] Order is paid but has no key, activating...');
       }
 
       const tgIdStr = orderRow.user_ref?.replace('tg_', '');
@@ -76,11 +97,22 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
           // Она создаст юзера, если его нет, или продлит существующего
           const vlessKey = await marzbanService.activateUser(tgId, days);
 
+          if (!vlessKey) {
+            fastify.log.error({ tgId, orderId }, '[Webhook] activateUser returned empty key');
+            throw new Error('Failed to get VPN key from Marzban');
+          }
+
           // Обновляем статус заказа и сохраняем ключ
-          ordersRepo.markPaidWithKey({ 
+          const saved = ordersRepo.markPaidWithKey({ 
             orderId, 
             key: vlessKey 
           });
+
+          if (!saved) {
+            fastify.log.error({ tgId, orderId, keyLength: vlessKey.length }, '[Webhook] Failed to save key to order');
+          } else {
+            fastify.log.info({ tgId, orderId, keyLength: vlessKey.length }, '[Webhook] Key saved to order');
+          }
 
           // Отправляем уведомление пользователю
           if (botToken) {

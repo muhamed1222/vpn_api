@@ -73,32 +73,59 @@ export class YooKassaClient {
     const key = idempotenceKey || uuidv4();
     const auth = Buffer.from(`${this.shopId}:${this.secretKey}`).toString('base64');
 
-    const response = await fetch(`${this.baseUrl}/payments`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${auth}`,
-        'Idempotence-Key': key,
-      },
-      body: JSON.stringify(params),
-    });
+    // Таймаут для запроса к YooKassa (30 секунд)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      let errorDetails: unknown;
-      try {
-        errorDetails = JSON.parse(errorText);
-      } catch {
-        errorDetails = errorText;
+    try {
+      const response = await fetch(`${this.baseUrl}/payments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Basic ${auth}`,
+          'Idempotence-Key': key,
+        },
+        body: JSON.stringify(params),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorDetails: unknown;
+        try {
+          errorDetails = JSON.parse(errorText);
+        } catch {
+          errorDetails = errorText;
+        }
+
+        // Специальная обработка ошибки аутентификации
+        if (response.status === 401) {
+          const errorMsg = typeof errorDetails === 'object' && errorDetails !== null && 'code' in errorDetails
+            ? `YooKassa authentication failed: ${JSON.stringify(errorDetails)}. Проверьте YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY в .env`
+            : `YooKassa authentication failed. Проверьте YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY в .env`;
+          throw new Error(errorMsg);
+        }
+
+        throw new Error(
+          `YooKassa API error: ${response.status} ${response.statusText}. Details: ${JSON.stringify(errorDetails)}`
+        );
       }
 
-      throw new Error(
-        `YooKassa API error: ${response.status} ${response.statusText}. Details: ${JSON.stringify(errorDetails)}`
-      );
+      const result = await response.json() as YooKassaPaymentResponse;
+      return result;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      
+      // Обработка таймаута
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error('YooKassa API timeout: запрос превысил 30 секунд');
+      }
+      
+      // Пробрасываем другие ошибки
+      throw error;
     }
-
-    const result = await response.json() as YooKassaPaymentResponse;
-    return result;
   }
 }
 

@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getPlanPrice } from '../../config/plans.js';
 import * as ordersRepo from '../../storage/ordersRepo.js';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
+import fs from 'fs';
 
 const createOrderSchema = z.object({
   planId: z.string().min(1),
@@ -61,6 +62,61 @@ export async function ordersRoutes(fastify: FastifyInstance) {
 
       const { planId, tgId } = request.body;
 
+      // Проверка: если пользователь пытается купить plan_7, но у него уже есть оплаченные ордера - отклоняем
+      if (planId === 'plan_7') {
+        let userRefForCheck: string;
+        if (request.user.isAdmin && tgId) {
+          userRefForCheck = `tg_${tgId}`;
+        } else if (request.user.tgId) {
+          userRefForCheck = `tg_${request.user.tgId}`;
+        } else {
+          return reply.status(401).send({ error: 'User ID missing in token' });
+        }
+
+        // Проверяем оплаченные ордера в базе API
+        const orders = ordersRepo.getOrdersByUser(userRefForCheck);
+        const hasPaidOrders = orders.some(o => o.status === 'paid');
+        
+        if (hasPaidOrders) {
+          fastify.log.warn({ tgId: request.user.tgId || tgId, planId }, '[Orders] User tried to buy plan_7 but has paid orders');
+          return reply.status(400).send({ 
+            error: 'Trial plan unavailable',
+            message: 'Пробная подписка доступна только один раз. Выберите другой тариф.'
+          });
+        }
+
+        // Дополнительная проверка через базу бота
+        const botDbPath = process.env.BOT_DATABASE_PATH || '/root/vpn_bot/data/database.sqlite';
+        if (fs.existsSync(botDbPath)) {
+          try {
+            const { getDatabase } = await import('../../storage/db.js');
+            const db = getDatabase();
+            try {
+              db.prepare('ATTACH DATABASE ? AS bot_db').run(botDbPath);
+              const botPaidOrder = db.prepare(`
+                SELECT 1 FROM bot_db.orders 
+                WHERE user_id = ? AND status IN ('PAID', 'COMPLETED') 
+                LIMIT 1
+              `).get(request.user.tgId || tgId);
+              
+              if (botPaidOrder) {
+                db.prepare('DETACH DATABASE bot_db').run();
+                fastify.log.warn({ tgId: request.user.tgId || tgId, planId }, '[Orders] User tried to buy plan_7 but has paid orders in bot DB');
+                return reply.status(400).send({ 
+                  error: 'Trial plan unavailable',
+                  message: 'Пробная подписка доступна только один раз. Выберите другой тариф.'
+                });
+              }
+              db.prepare('DETACH DATABASE bot_db').run();
+            } catch (attachError) {
+              fastify.log.warn({ err: attachError }, 'Failed to check bot database');
+            }
+          } catch (e) {
+            fastify.log.error({ err: e }, 'Error checking trial availability in bot database');
+          }
+        }
+      }
+
       let userRef: string;
 
       if (request.user.isAdmin) {
@@ -90,7 +146,7 @@ export async function ordersRoutes(fastify: FastifyInstance) {
         });
 
         // Создаем платеж в YooKassa
-        // Для РФ требуется receipt (чек) - добавляем минимальный receipt
+        // Для РФ требуется receipt (чек) - добавляем receipt с валидным форматом
         const paymentParams: any = {
           amount: {
             value: amount.value,
@@ -109,7 +165,8 @@ export async function ordersRoutes(fastify: FastifyInstance) {
           },
           receipt: {
             customer: {
-              email: 'noreply@outlivion.space', // Обязательное поле для receipt
+              // Email для receipt (требуется для ФНС в РФ)
+              email: 'noreply@outlivion.space',
             },
             items: [
               {
@@ -119,8 +176,8 @@ export async function ordersRoutes(fastify: FastifyInstance) {
                   value: amount.value,
                   currency: amount.currency,
                 },
-                vat_code: 1, // Без НДС (vat_code: 1 = без НДС)
-                payment_subject: 'service', // Услуга (VPN)
+                vat_code: 1, // Без НДС
+                payment_subject: 'service', // Услуга
                 payment_mode: 'full_prepayment', // Полная предоплата
               },
             ],
@@ -131,6 +188,24 @@ export async function ordersRoutes(fastify: FastifyInstance) {
           paymentParams,
           idempotenceKey
         );
+
+        // Проверяем, что payment содержит необходимые данные
+        if (!payment || !payment.id) {
+          throw new Error('YooKassa вернул неполный ответ: отсутствует payment.id');
+        }
+
+        if (!payment.confirmation || !payment.confirmation.confirmation_url) {
+          fastify.log.error(
+            {
+              paymentId: payment.id,
+              paymentStatus: payment.status,
+              hasConfirmation: !!payment.confirmation,
+              paymentData: JSON.stringify(payment).substring(0, 500),
+            },
+            'YooKassa payment missing confirmation_url'
+          );
+          throw new Error(`YooKassa payment не содержит confirmation_url. Status: ${payment.status}`);
+        }
 
         // Сохраняем yookassa_payment_id в заказ
         ordersRepo.setPaymentId({
@@ -146,23 +221,39 @@ export async function ordersRoutes(fastify: FastifyInstance) {
           paymentUrl: payment.confirmation.confirmation_url,
         };
 
+        fastify.log.info(
+          {
+            orderId,
+            paymentId: payment.id,
+            paymentUrl: payment.confirmation.confirmation_url,
+          },
+          'Order created successfully with payment URL'
+        );
+
         return reply.status(201).send(response);
       } catch (error) {
         // Если YooKassa createPayment упал, заказ остается pending
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        
+        // Детальное логирование ошибки для диагностики
         fastify.log.error(
           {
             err: error,
+            errorMessage,
             orderId,
             planId,
             userRef,
+            amount: amount.value,
+            currency: amount.currency,
           },
           'Failed to create YooKassa payment'
         );
 
-        // Логируем детали без секретов
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        const sanitizedError = errorMessage.replace(/SHOP_ID|SECRET_KEY|Authorization/g, '[REDACTED]');
+        // Логируем полную ошибку в консоль для отладки (без секретов)
+        const sanitizedError = errorMessage.replace(/SHOP_ID|SECRET_KEY|Authorization|Basic [A-Za-z0-9+/=]+/g, '[REDACTED]');
+        fastify.log.error({ fullError: sanitizedError }, 'YooKassa payment error details');
 
+        // Возвращаем более информативную ошибку
         return reply.status(500).send({
           error: 'Failed to create payment',
           message: 'Payment service temporarily unavailable. Order created but payment link could not be generated.',
