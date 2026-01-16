@@ -6,6 +6,9 @@ import { authRoutes } from './auth.js';
 import { userRoutes } from './user.js';
 import { tariffsRoutes } from './tariffs.js';
 import { serversRoutes } from './servers.js';
+import { contestRoutes } from './contest.js';
+import { referralRoutes } from './referral.js';
+import { adminRoutes } from './admin.js';
 
 export async function v1Routes(fastify: FastifyInstance) {
   // Rate limiting для всех роутов v1
@@ -30,5 +33,33 @@ export async function v1Routes(fastify: FastifyInstance) {
   await fastify.register(tariffsRoutes, { prefix: '/tariffs' });
 
   // Регистрируем роуты для серверов (доступно всем)
-  await fastify.register(serversRoutes, { prefix: '/servers' });
+  try {
+    await fastify.register(serversRoutes, { prefix: '/servers' });
+  } catch (error) {
+    fastify.log.warn({ err: error }, 'Failed to register servers routes');
+  }
+
+  // Регистрируем роуты для конкурса
+  try {
+    await fastify.register(contestRoutes, { prefix: '/contest' });
+    fastify.log.info('Contest routes registered');
+  } catch (error) {
+    fastify.log.error({ err: error }, 'Failed to register contest routes');
+  }
+
+  // Регистрируем роуты для реферальной программы
+  try {
+    await fastify.register(referralRoutes, { prefix: '/referral' });
+    fastify.log.info('Referral routes registered');
+  } catch (error) {
+    fastify.log.error({ err: error }, 'Failed to register referral routes');
+  }
+
+  // Регистрируем админские роуты
+  try {
+    await fastify.register(adminRoutes, { prefix: '/admin' });
+    fastify.log.info('Admin routes registered');
+  } catch (error) {
+    fastify.log.error({ err: error }, 'Failed to register admin routes');
+  }
 }
