@@ -4,7 +4,7 @@ export interface OrderRow {
   order_id: string;
   user_ref: string | null;
   plan_id: string;
-  status: 'pending' | 'paid' | 'canceled';
+  status: 'pending' | 'paid' | 'completed' | 'canceled';
   yookassa_payment_id: string | null;
   amount_value: string | null;
   amount_currency: string | null;

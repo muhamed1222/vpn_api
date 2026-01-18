@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import axios from 'axios';
+import fs from 'fs';
 import * as ordersRepo from '../../storage/ordersRepo.js';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
 import { isYooKassaIP } from '../../config/yookassa.js';
@@ -137,10 +138,20 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
           
           // Уведомляем админа о сбое
           if (botToken) {
-            await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-              chat_id: 7972426786,
-              text: `🚨 <b>ОШИБКА СОЗДАНИЯ КЛЮЧА</b>\nЮзер: ${tgId}\nОшибка: ${e.message}\n\nСрочно проверьте панель Marzban!`
-            }).catch(() => {});
+            // Получаем первый ADMIN_ID из переменной окружения
+            const adminIdsRaw = process.env.ADMIN_ID || '';
+            const adminIds = adminIdsRaw
+              .split(',')
+              .map(id => parseInt(id.trim(), 10))
+              .filter(id => Number.isFinite(id) && id > 0);
+            const adminChatId = adminIds.length > 0 ? adminIds[0] : null;
+            
+            if (adminChatId) {
+              await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                chat_id: adminChatId,
+                text: `🚨 <b>ОШИБКА СОЗДАНИЯ КЛЮЧА</b>\nЮзер: ${tgId}\nОшибка: ${e.message}\n\nСрочно проверьте панель Marzban!`
+              }).catch(() => {});
+            }
           }
         }
       }
@@ -152,18 +163,102 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
   /**
    * GET /v1/payments/history
    * История платежей пользователя
+   * Читает заказы из обеих баз: API и бота
    */
   fastify.get('/history', { preHandler: verifyAuth }, async (request, reply) => {
     if (!request.user) {
       return reply.status(401).send({ error: 'Unauthorized' });
     }
 
-    const userRef = `tg_${request.user.tgId}`;
-    const orders = ordersRepo.getOrdersByUser(userRef);
+    const tgId = request.user.tgId;
+    const userRef = `tg_${tgId}`;
+    
+    // Получаем заказы из базы API
+    const apiOrders = ordersRepo.getOrdersByUser(userRef);
+
+    // Получаем заказы из базы бота (если доступна)
+    const botOrders: Array<{
+      id: string;
+      plan_id: string;
+      status: string;
+      amount: number | null;
+      currency: string | null;
+      created_at: number;
+      updated_at?: number;
+    }> = [];
+
+    const botDbPath = process.env.BOT_DATABASE_PATH || '/root/vpn_bot/data/database.sqlite';
+    if (fs.existsSync(botDbPath)) {
+      try {
+        const { getDatabase } = await import('../../storage/db.js');
+        const db = getDatabase();
+        try {
+          db.prepare('ATTACH DATABASE ? AS bot_db').run(botDbPath);
+          const botOrdersRows = db.prepare(`
+            SELECT id, plan_id, status, amount, currency, created_at
+            FROM bot_db.orders 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+            LIMIT 50
+          `).all(tgId) as any[];
+
+          botOrders.push(...botOrdersRows.map(row => ({
+            id: row.id,
+            plan_id: row.plan_id,
+            status: row.status.toLowerCase(), // COMPLETED -> completed
+            amount: row.amount,
+            currency: row.currency || 'RUB',
+            created_at: row.created_at, // уже в миллисекундах
+          })));
+
+          db.prepare('DETACH DATABASE bot_db').run();
+        } catch (attachError) {
+          fastify.log.warn({ err: attachError }, '[Payments] Failed to read bot database');
+          try {
+            db.prepare('DETACH DATABASE bot_db').run();
+          } catch (detachError) {
+            // Игнорируем ошибку отключения
+          }
+        }
+      } catch (e) {
+        fastify.log.error({ err: e }, '[Payments] Error reading bot database');
+      }
+    }
+
+    // Объединяем заказы из обеих баз
+    const allOrders = [
+      ...apiOrders.map(order => ({
+        id: order.order_id,
+        plan_id: order.plan_id,
+        status: order.status,
+        amount: order.amount_value ? parseFloat(order.amount_value) : 0,
+        currency: order.amount_currency || 'RUB',
+        date: new Date(order.updated_at || order.created_at).getTime(),
+        yookassa_payment_id: order.yookassa_payment_id,
+      })),
+      ...botOrders.map(order => ({
+        id: order.id,
+        plan_id: order.plan_id,
+        status: order.status,
+        amount: order.amount || 0,
+        currency: order.currency || 'RUB',
+        date: order.created_at,
+        yookassa_payment_id: null,
+      })),
+    ];
+
+    // Удаляем дубликаты (по order_id) и оставляем последний
+    const uniqueOrders = new Map<string, typeof allOrders[0]>();
+    for (const order of allOrders) {
+      const existing = uniqueOrders.get(order.id);
+      if (!existing || order.date > existing.date) {
+        uniqueOrders.set(order.id, order);
+      }
+    }
 
     // Преобразуем заказы в формат для фронтенда
-    const payments = orders
-      .filter(order => order.status === 'paid' || order.status === 'pending')
+    const payments = Array.from(uniqueOrders.values())
+      .filter(order => order.status === 'paid' || order.status === 'pending' || order.status === 'completed')
       .map(order => {
         // Определяем название плана
         let planName = order.plan_id;
@@ -174,12 +269,12 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
         else if (order.plan_id === 'plan_365') planName = '1 год';
 
         return {
-          id: order.yookassa_payment_id || order.order_id,
-          orderId: order.order_id,
-          amount: order.amount_value ? parseFloat(order.amount_value) : 0,
-          currency: order.amount_currency || 'RUB',
-          date: new Date(order.updated_at || order.created_at).getTime(),
-          status: order.status === 'paid' ? 'success' as const : 
+          id: order.yookassa_payment_id || order.id,
+          orderId: order.id,
+          amount: order.amount,
+          currency: order.currency,
+          date: order.date,
+          status: order.status === 'paid' || order.status === 'completed' ? 'success' as const : 
                   order.status === 'pending' ? 'pending' as const : 
                   'fail' as const,
           planId: order.plan_id,

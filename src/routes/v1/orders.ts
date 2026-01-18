@@ -76,10 +76,10 @@ export async function ordersRoutes(fastify: FastifyInstance) {
         // Проверяем оплаченные ордера в базе API
         const orders = ordersRepo.getOrdersByUser(userRefForCheck);
         const hasPaidOrders = orders.some(o => o.status === 'paid');
-        
+
         if (hasPaidOrders) {
           fastify.log.warn({ tgId: request.user.tgId || tgId, planId }, '[Orders] User tried to buy plan_7 but has paid orders');
-          return reply.status(400).send({ 
+          return reply.status(400).send({
             error: 'Trial plan unavailable',
             message: 'Пробная подписка доступна только один раз. Выберите другой тариф.'
           });
@@ -98,11 +98,11 @@ export async function ordersRoutes(fastify: FastifyInstance) {
                 WHERE user_id = ? AND status IN ('PAID', 'COMPLETED') 
                 LIMIT 1
               `).get(request.user.tgId || tgId);
-              
+
               if (botPaidOrder) {
                 db.prepare('DETACH DATABASE bot_db').run();
                 fastify.log.warn({ tgId: request.user.tgId || tgId, planId }, '[Orders] User tried to buy plan_7 but has paid orders in bot DB');
-                return reply.status(400).send({ 
+                return reply.status(400).send({
                   error: 'Trial plan unavailable',
                   message: 'Пробная подписка доступна только один раз. Выберите другой тариф.'
                 });
@@ -135,7 +135,63 @@ export async function ordersRoutes(fastify: FastifyInstance) {
       const idempotenceKey = uuidv4(); // Уникальный ключ для каждого запроса
 
       // Определяем сумму по planId
-      const amount = getPlanPrice(planId);
+      let amount = getPlanPrice(planId);
+
+      // Проверяем скидку пользователя из базы бота
+      const botDbPath = process.env.BOT_DATABASE_PATH || '/root/vpn_bot/data/database.sqlite';
+      let discountPercent = 0;
+
+      if (fs.existsSync(botDbPath)) {
+        try {
+          const { getDatabase } = await import('../../storage/db.js');
+          const db = getDatabase();
+          try {
+            db.prepare('ATTACH DATABASE ? AS bot_db').run(botDbPath);
+            const userRow = db.prepare(`
+              SELECT discount_percent, discount_expires_at 
+              FROM bot_db.users 
+              WHERE id = ?
+            `).get(request.user.tgId || tgId) as any;
+
+            if (userRow) {
+              const now = Date.now();
+              // Проверяем, не истекла ли скидка
+              if (userRow.discount_percent &&
+                (!userRow.discount_expires_at || userRow.discount_expires_at > now)) {
+                discountPercent = userRow.discount_percent || 0;
+              }
+            }
+
+            db.prepare('DETACH DATABASE bot_db').run();
+          } catch (attachError) {
+            fastify.log.warn({ err: attachError }, 'Failed to check user discount from bot database');
+          }
+        } catch (e) {
+          fastify.log.error({ err: e }, 'Error checking user discount in bot database');
+        }
+      }
+
+      // Применяем скидку к цене
+      if (discountPercent > 0 && discountPercent <= 100) {
+        const originalValue = parseFloat(amount.value);
+        const discountedValue = Math.round((originalValue * (100 - discountPercent)) / 100);
+        // Минимальная цена - 1 рубль (защита от нуля)
+        const finalValue = Math.max(1, discountedValue);
+        amount = {
+          value: finalValue.toFixed(2),
+          currency: amount.currency,
+          stars: amount.stars,
+        };
+        fastify.log.info(
+          {
+            tgId: request.user.tgId || tgId,
+            discountPercent,
+            originalValue,
+            finalValue
+          },
+          'Applied discount to order'
+        );
+      }
 
       try {
         // Сначала создаем заказ в БД со статусом pending
@@ -234,7 +290,7 @@ export async function ordersRoutes(fastify: FastifyInstance) {
       } catch (error) {
         // Если YooKassa createPayment упал, заказ остается pending
         const errorMessage = error instanceof Error ? error.message : String(error);
-        
+
         // Детальное логирование ошибки для диагностики
         fastify.log.error(
           {

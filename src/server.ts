@@ -10,7 +10,13 @@ import { YooKassaClient } from './integrations/yookassa/client.js';
 import { MarzbanService } from './integrations/marzban/service.js';
 
 // Загружаем переменные окружения
-dotenv.config();
+// Указываем явный путь к .env файлу для надежности
+// При запуске из dist/server.js путь должен быть относительно корня проекта
+import { join } from 'path';
+// Путь к .env: из dist/server.js -> на уровень выше -> .env
+// process.cwd() вернет /opt/outlivion-api при запуске через systemd
+const envPath = join(process.cwd(), '.env');
+dotenv.config({ path: envPath });
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -57,6 +63,7 @@ declare module 'fastify' {
     authJwtSecret: string;
     authCookieName: string;
     authCookieDomain: string;
+    adminApiKey: string;
   }
 }
 
@@ -86,6 +93,7 @@ fastify.decorate('telegramBotToken', TELEGRAM_BOT_TOKEN);
 fastify.decorate('authJwtSecret', AUTH_JWT_SECRET);
 fastify.decorate('authCookieName', AUTH_COOKIE_NAME);
 fastify.decorate('authCookieDomain', AUTH_COOKIE_DOMAIN);
+fastify.decorate('adminApiKey', process.env.ADMIN_API_KEY || '');
 
 // Инициализируем Marzban сервис
 const marzbanService = new MarzbanService(
