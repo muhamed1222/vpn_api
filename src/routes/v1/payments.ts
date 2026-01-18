@@ -5,6 +5,7 @@ import fs from 'fs';
 import * as ordersRepo from '../../storage/ordersRepo.js';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
 import { isYooKassaIP } from '../../config/yookassa.js';
+import { awardTicketsForPayment } from '../../storage/contestUtils.js';
 
 const yookassaWebhookSchema = z.object({
   type: z.literal('notification'),
@@ -113,6 +114,29 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
             fastify.log.error({ tgId, orderId, keyLength: vlessKey.length }, '[Webhook] Failed to save key to order');
           } else {
             fastify.log.info({ tgId, orderId, keyLength: vlessKey.length }, '[Webhook] Key saved to order');
+          }
+
+          // Начисляем билеты рефереру, если применимо
+          const botDbPath = process.env.BOT_DATABASE_PATH || '/root/vpn_bot/data/database.sqlite';
+          if (fs.existsSync(botDbPath)) {
+            try {
+              const orderCreatedAt = orderRow.created_at || new Date().toISOString();
+              const ticketsAwarded = await awardTicketsForPayment(
+                botDbPath,
+                tgId,
+                orderId,
+                planId,
+                orderCreatedAt
+              );
+              if (ticketsAwarded) {
+                fastify.log.info({ tgId, orderId, planId }, '[Webhook] Tickets awarded to referrer');
+              } else {
+                fastify.log.debug({ tgId, orderId }, '[Webhook] No tickets awarded (no referrer or outside contest period)');
+              }
+            } catch (ticketError: any) {
+              fastify.log.error({ err: ticketError?.message, tgId, orderId }, '[Webhook] Failed to award tickets');
+              // Не прерываем процесс - оплата уже обработана
+            }
           }
 
           // Отправляем уведомление пользователю

@@ -98,3 +98,218 @@ export function checkContestTables(
 
   return { refEventsExists, ticketLedgerExists };
 }
+
+/**
+ * Начисляет билеты при оплате подписки
+ * 
+ * Логика начисления:
+ * 1. ВСЕГДА начисляет билеты самому покупателю (SELF_PURCHASE)
+ * 2. Если у покупателя есть реферер (и прошел все проверки) - начисляет билеты и рефереру (INVITEE_PAYMENT)
+ * 
+ * Проверки для реферера:
+ * - Период конкурса
+ * - Окно атрибуции (7 дней от привязки)
+ * - Квалификация (не было оплат до привязки)
+ * 
+ * @param botDbPath - Путь к базе данных бота
+ * @param referredTgId - Telegram ID пользователя (кто оплатил)
+ * @param orderId - ID заказа
+ * @param planId - ID плана подписки
+ * @param orderCreatedAt - Дата создания заказа (ISO string)
+ * @returns true если билеты начислены (хотя бы пользователю), false если не подходит под условия конкурса
+ */
+export async function awardTicketsForPayment(
+  botDbPath: string,
+  referredTgId: number,
+  orderId: string,
+  planId: string,
+  orderCreatedAt: string
+): Promise<boolean> {
+  const { getDatabase } = await import('./db.js');
+  // Используем прямую функцию из того же модуля (циклический импорт избегаем)
+  const db = getDatabase();
+  
+  try {
+    // Прикрепляем базу бота
+    try {
+      db.prepare('ATTACH DATABASE ? AS bot_db').run(botDbPath);
+    } catch (error) {
+      console.error(`[awardTicketsForPayment] Failed to attach database: ${botDbPath}`, error);
+      if (error instanceof Error) {
+        throw new Error(`Failed to attach bot database: ${error.message}`);
+      }
+      throw error;
+    }
+    
+    try {
+      // Получаем активный конкурс
+      const contest = db.prepare(`
+        SELECT id, starts_at, ends_at, attribution_window_days
+        FROM bot_db.contests
+        WHERE is_active = 1
+        ORDER BY starts_at DESC
+        LIMIT 1
+      `).get() as {
+        id: string;
+        starts_at: string;
+        ends_at: string;
+        attribution_window_days: number;
+      } | undefined;
+
+      if (!contest) {
+        console.log('[awardTicketsForPayment] No active contest found');
+        return false;
+      }
+
+      // Проверяем, попадает ли заказ в период конкурса
+      const orderDate = new Date(orderCreatedAt);
+      const contestStart = new Date(contest.starts_at);
+      const contestEnd = new Date(contest.ends_at);
+      
+      if (orderDate < contestStart || orderDate > contestEnd) {
+        console.log(`[awardTicketsForPayment] Order ${orderId} is outside contest period`);
+        return false;
+      }
+
+      // Находим реферера (если есть)
+      const referral = db.prepare(`
+        SELECT referrer_id
+        FROM bot_db.user_referrals
+        WHERE referred_id = ?
+        LIMIT 1
+      `).get(referredTgId) as { referrer_id: number } | undefined;
+
+      let referrerId: number | null = null;
+      let bindingDate: Date | null = null;
+
+      // Если есть реферер, проверяем квалификацию
+      if (referral) {
+        referrerId = referral.referrer_id;
+        
+        // Проверяем, не является ли это саморефералом
+        if (referrerId === referredTgId) {
+          console.log(`[awardTicketsForPayment] Self-referral detected: ${referredTgId}`);
+          referrerId = null; // Игнорируем самореферал
+        } else {
+          // Проверяем окно атрибуции
+          const referralBinding = db.prepare(`
+            SELECT created_at
+            FROM bot_db.user_referrals
+            WHERE referrer_id = ? AND referred_id = ?
+            LIMIT 1
+          `).get(referrerId, referredTgId) as { created_at: string | number } | undefined;
+
+          if (referralBinding) {
+            bindingDate = typeof referralBinding.created_at === 'string' 
+              ? new Date(referralBinding.created_at)
+              : new Date(referralBinding.created_at * 1000);
+            
+            const attributionDeadline = new Date(bindingDate);
+            attributionDeadline.setDate(attributionDeadline.getDate() + contest.attribution_window_days);
+            
+            if (orderDate > attributionDeadline) {
+              console.log(`[awardTicketsForPayment] Order ${orderId} is outside attribution window`);
+              referrerId = null; // Пропускаем реферера из-за окна атрибуции
+            } else {
+              // Проверяем квалификацию: не было ли оплат до привязки
+              const priorPayments = db.prepare(`
+                SELECT COUNT(*) as count
+                FROM bot_db.orders
+                WHERE user_id = ?
+                  AND status IN ('PAID', 'COMPLETED')
+                  AND created_at < ?
+              `).get(referredTgId, bindingDate.toISOString()) as { count: number } | undefined;
+
+              if (priorPayments && priorPayments.count > 0) {
+                console.log(`[awardTicketsForPayment] User ${referredTgId} had ${priorPayments.count} payments before binding - referrer not qualified`);
+                referrerId = null; // Пропускаем реферера из-за квалификации
+              }
+            }
+          } else {
+            referrerId = null;
+          }
+        }
+      }
+
+      // Рассчитываем количество билетов (используем функцию из того же модуля)
+      const ticketsDelta = getTicketsFromPlanId(planId);
+      
+      if (ticketsDelta <= 0) {
+        console.log(`[awardTicketsForPayment] Invalid plan_id: ${planId}`);
+        return false;
+      }
+
+      // Проверяем наличие таблиц
+      const { ticketLedgerExists, refEventsExists } = checkContestTables(db, 'bot_db');
+      
+      if (!ticketLedgerExists) {
+        console.warn('[awardTicketsForPayment] ticket_ledger table not found');
+        return false;
+      }
+
+      const now = new Date().toISOString();
+      let ticketsAwarded = false;
+
+      // 1. ВСЕГДА начисляем билеты самому пользователю (покупателю)
+      const selfTicketId = `ticket_self_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+      db.prepare(`
+        INSERT INTO bot_db.ticket_ledger (
+          id, contest_id, referrer_id, referred_id, order_id, delta, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'SELF_PURCHASE', ?)
+      `).run(selfTicketId, contest.id, referredTgId, referredTgId, orderId, ticketsDelta, now);
+      ticketsAwarded = true;
+      console.log(`[awardTicketsForPayment] Awarded ${ticketsDelta} tickets to user ${referredTgId} (self-purchase)`);
+
+      // 2. Если есть реферер (и он прошел все проверки) - начисляем билеты и ему тоже
+      if (referrerId !== null) {
+        const referrerTicketId = `ticket_ref_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        
+        db.prepare(`
+          INSERT INTO bot_db.ticket_ledger (
+            id, contest_id, referrer_id, referred_id, order_id, delta, reason, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'INVITEE_PAYMENT', ?)
+        `).run(referrerTicketId, contest.id, referrerId, referredTgId, orderId, ticketsDelta, now);
+
+        ticketsAwarded = true;
+        console.log(`[awardTicketsForPayment] Awarded ${ticketsDelta} tickets to referrer ${referrerId} for order ${orderId}`);
+
+        // Обновляем или создаем запись в ref_events
+        if (refEventsExists && bindingDate) {
+          const existingEvent = db.prepare(`
+            SELECT id, status
+            FROM bot_db.ref_events
+            WHERE contest_id = ? AND referrer_id = ? AND referred_id = ?
+            LIMIT 1
+          `).get(contest.id, referrerId, referredTgId) as { id: string; status: string } | undefined;
+
+          if (existingEvent) {
+            // Обновляем статус на 'qualified'
+            db.prepare(`
+              UPDATE bot_db.ref_events
+              SET status = 'qualified',
+                  qualified_at = ?
+              WHERE id = ?
+            `).run(now, existingEvent.id);
+          } else {
+            // Создаем новую запись
+            const eventId = `ref_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+            const bindingDateStr = bindingDate.toISOString();
+            db.prepare(`
+              INSERT INTO bot_db.ref_events (
+                id, contest_id, referrer_id, referred_id, bound_at, status, qualified_at
+              ) VALUES (?, ?, ?, ?, ?, 'qualified', ?)
+            `).run(eventId, contest.id, referrerId, referredTgId, bindingDateStr, now);
+          }
+        }
+      }
+
+      return ticketsAwarded;
+
+    } finally {
+      db.prepare('DETACH DATABASE bot_db').run();
+    }
+  } catch (error) {
+    console.error(`[awardTicketsForPayment] Error:`, error);
+    return false;
+  }
+}
