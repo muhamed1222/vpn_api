@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
 import { getAllContestParticipants } from '../../storage/contestRepo.js';
 import Database from 'better-sqlite3';
+import { awardRetryScheduler } from '../../services/awardRetryScheduler.js';
 
 /**
  * Проверка, является ли пользователь админом
@@ -190,6 +191,30 @@ export async function adminRoutes(fastify: FastifyInstance) {
         return reply.status(500).send({
           error: 'Internal Server Error',
           message: 'Failed to fetch participants'
+        });
+      }
+    }
+  );
+
+  /**
+   * GET /v1/admin/award-retry-stats
+   * Получить статистику очереди повторных попыток начисления билетов (админский endpoint)
+   */
+  fastify.get(
+    '/award-retry-stats',
+    {
+      preHandler: [verifyAuth, verifyAdmin]
+    },
+    async (request, reply) => {
+      try {
+        const stats = awardRetryScheduler.getStats();
+        fastify.log.info({ queueSize: stats.queueSize }, '[Admin] Award retry stats requested');
+        return reply.send(stats);
+      } catch (error) {
+        fastify.log.error({ err: error }, '[Admin] Error fetching award retry stats');
+        return reply.status(500).send({
+          error: 'Internal Server Error',
+          message: 'Failed to fetch award retry stats'
         });
       }
     }

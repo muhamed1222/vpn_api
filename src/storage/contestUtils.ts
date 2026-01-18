@@ -264,62 +264,100 @@ export async function awardTicketsForPayment(
       }
 
       const now = new Date().toISOString();
-      let ticketsAwarded = false;
+      
+      // ОБОРАЧИВАЕМ ВСЕ ОПЕРАЦИИ НАЧИСЛЕНИЯ В ТРАНЗАКЦИЮ для атомарности
+      // Если любая операция упадет - все изменения откатятся автоматически
+      const awardTicketsTransaction = db.transaction((
+        contestId: string,
+        referredId: number,
+        referrerId: number | null,
+        orderId: string,
+        ticketsDelta: number,
+        bindingDate: Date | null,
+        refEventsExists: boolean
+      ) => {
+        let ticketsAwarded = false;
 
-      // 1. ВСЕГДА начисляем билеты самому пользователю (покупателю)
-      const selfTicketId = `ticket_self_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-      db.prepare(`
-        INSERT INTO bot_db.ticket_ledger (
-          id, contest_id, referrer_id, referred_id, order_id, delta, reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'SELF_PURCHASE', ?)
-      `).run(selfTicketId, contest.id, referredTgId, referredTgId, orderId, ticketsDelta, now);
-      ticketsAwarded = true;
-      console.log(`[awardTicketsForPayment] Awarded ${ticketsDelta} tickets to user ${referredTgId} (self-purchase)`);
-
-      // 2. Если есть реферер (и он прошел все проверки) - начисляем билеты и ему тоже
-      if (referrerId !== null) {
-        const referrerTicketId = `ticket_ref_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-        
+        // 1. ВСЕГДА начисляем билеты самому пользователю (покупателю)
+        const selfTicketId = `ticket_self_${Date.now()}_${Math.random().toString(36).substring(7)}`;
         db.prepare(`
           INSERT INTO bot_db.ticket_ledger (
             id, contest_id, referrer_id, referred_id, order_id, delta, reason, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'INVITEE_PAYMENT', ?)
-        `).run(referrerTicketId, contest.id, referrerId, referredTgId, orderId, ticketsDelta, now);
-
+          ) VALUES (?, ?, ?, ?, ?, ?, 'SELF_PURCHASE', ?)
+        `).run(selfTicketId, contestId, referredId, referredId, orderId, ticketsDelta, now);
         ticketsAwarded = true;
-        console.log(`[awardTicketsForPayment] Awarded ${ticketsDelta} tickets to referrer ${referrerId} for order ${orderId}`);
+        console.log(`[awardTicketsForPayment] Awarded ${ticketsDelta} tickets to user ${referredId} (self-purchase)`);
 
-        // Обновляем или создаем запись в ref_events
-        if (refEventsExists && bindingDate) {
-          const existingEvent = db.prepare(`
-            SELECT id, status
-            FROM bot_db.ref_events
-            WHERE contest_id = ? AND referrer_id = ? AND referred_id = ?
-            LIMIT 1
-          `).get(contest.id, referrerId, referredTgId) as { id: string; status: string } | undefined;
+        // 2. Если есть реферер (и он прошел все проверки) - начисляем билеты и ему тоже
+        if (referrerId !== null) {
+          const referrerTicketId = `ticket_ref_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+          
+          db.prepare(`
+            INSERT INTO bot_db.ticket_ledger (
+              id, contest_id, referrer_id, referred_id, order_id, delta, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'INVITEE_PAYMENT', ?)
+          `).run(referrerTicketId, contestId, referrerId, referredId, orderId, ticketsDelta, now);
 
-          if (existingEvent) {
-            // Обновляем статус на 'qualified'
-            db.prepare(`
-              UPDATE bot_db.ref_events
-              SET status = 'qualified',
-                  qualified_at = ?
-              WHERE id = ?
-            `).run(now, existingEvent.id);
-          } else {
-            // Создаем новую запись
-            const eventId = `ref_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-            const bindingDateStr = bindingDate.toISOString();
-            db.prepare(`
-              INSERT INTO bot_db.ref_events (
-                id, contest_id, referrer_id, referred_id, bound_at, status, qualified_at
-              ) VALUES (?, ?, ?, ?, ?, 'qualified', ?)
-            `).run(eventId, contest.id, referrerId, referredTgId, bindingDateStr, now);
+          ticketsAwarded = true;
+          console.log(`[awardTicketsForPayment] Awarded ${ticketsDelta} tickets to referrer ${referrerId} for order ${orderId}`);
+
+          // Обновляем или создаем запись в ref_events (в той же транзакции)
+          if (refEventsExists && bindingDate) {
+            const existingEvent = db.prepare(`
+              SELECT id, status
+              FROM bot_db.ref_events
+              WHERE contest_id = ? AND referrer_id = ? AND referred_id = ?
+              LIMIT 1
+            `).get(contestId, referrerId, referredId) as { id: string; status: string } | undefined;
+
+            if (existingEvent) {
+              // Обновляем статус на 'qualified'
+              db.prepare(`
+                UPDATE bot_db.ref_events
+                SET status = 'qualified',
+                    qualified_at = ?
+                WHERE id = ?
+              `).run(now, existingEvent.id);
+            } else {
+              // Создаем новую запись
+              const eventId = `ref_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+              const bindingDateStr = bindingDate.toISOString();
+              db.prepare(`
+                INSERT INTO bot_db.ref_events (
+                  id, contest_id, referrer_id, referred_id, bound_at, status, qualified_at
+                ) VALUES (?, ?, ?, ?, ?, 'qualified', ?)
+              `).run(eventId, contestId, referrerId, referredId, bindingDateStr, now);
+            }
           }
         }
-      }
 
-      return ticketsAwarded;
+        return ticketsAwarded;
+      });
+
+      // ВЫПОЛНЯЕМ ТРАНЗАКЦИЮ (автоматически COMMIT при успехе, ROLLBACK при ошибке)
+      try {
+        const ticketsAwarded = awardTicketsTransaction(
+          contest.id,
+          referredTgId,
+          referrerId,
+          orderId,
+          ticketsDelta,
+          bindingDate,
+          refEventsExists
+        );
+        
+        return ticketsAwarded;
+      } catch (transactionError: any) {
+        // Проверяем, была ли транзакция принудительно откачена SQLite
+        if (!db.inTransaction) {
+          console.error('[awardTicketsForPayment] Transaction was forcefully rolled back by SQLite');
+          throw transactionError; // Перебрасываем ошибку
+        }
+        
+        // Другие типы ошибок
+        console.error('[awardTicketsForPayment] Error in transaction:', transactionError);
+        throw transactionError;
+      }
 
     } finally {
       db.prepare('DETACH DATABASE bot_db').run();

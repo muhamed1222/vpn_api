@@ -6,6 +6,7 @@ import * as ordersRepo from '../../storage/ordersRepo.js';
 import { createVerifyAuth } from '../../auth/verifyAuth.js';
 import { isYooKassaIP } from '../../config/yookassa.js';
 import { awardTicketsForPayment } from '../../storage/contestUtils.js';
+import { awardRetryScheduler } from '../../services/awardRetryScheduler.js';
 
 const yookassaWebhookSchema = z.object({
   type: z.literal('notification'),
@@ -116,7 +117,8 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
             fastify.log.info({ tgId, orderId, keyLength: vlessKey.length }, '[Webhook] Key saved to order');
           }
 
-          // Начисляем билеты рефереру, если применимо
+          // Начисляем билеты конкурса (покупателю и рефереру, если применимо)
+          // ВАЖНО: Изолируем ошибки начисления - они не должны прерывать основной поток обработки платежа
           const botDbPath = process.env.BOT_DATABASE_PATH || '/root/vpn_bot/data/database.sqlite';
           if (fs.existsSync(botDbPath)) {
             try {
@@ -155,21 +157,71 @@ export async function paymentsRoutes(fastify: FastifyInstance) {
                   // Игнорируем - используем orderRow.created_at
                 }
               }
-              const ticketsAwarded = await awardTicketsForPayment(
-                botDbPath,
-                tgId,
-                orderId,
-                planId,
-                orderCreatedAt
-              );
-              if (ticketsAwarded) {
-                fastify.log.info({ tgId, orderId, planId }, '[Webhook] Tickets awarded to referrer');
-              } else {
-                fastify.log.debug({ tgId, orderId }, '[Webhook] No tickets awarded (no referrer or outside contest period)');
+              
+              // АКТИВНОЕ НАЧИСЛЕНИЕ БИЛЕТОВ
+              // Используем try-catch для изоляции ошибок начисления от основного потока
+              try {
+                const ticketsAwarded = await awardTicketsForPayment(
+                  botDbPath,
+                  tgId,
+                  orderId,
+                  planId,
+                  orderCreatedAt
+                );
+                
+                if (ticketsAwarded) {
+                  fastify.log.info({ 
+                    tgId, 
+                    orderId, 
+                    planId 
+                  }, '[Webhook] ✅ Tickets awarded successfully');
+                } else {
+                  fastify.log.debug({ 
+                    tgId, 
+                    orderId 
+                  }, '[Webhook] No tickets awarded (no referrer or outside contest period)');
+                }
+              } catch (ticketError: any) {
+                // НЕ прерываем основной поток - оплата уже обработана
+                fastify.log.error({ 
+                  err: ticketError?.message,
+                  stack: ticketError?.stack,
+                  tgId, 
+                  orderId 
+                }, '[Webhook] ❌ Failed to award tickets (non-critical)');
+                
+                // ДОБАВЛЯЕМ В ОЧЕРЕДЬ ПОВТОРНЫХ ПОПЫТОК
+                awardRetryScheduler.addToRetryQueue(
+                  tgId,
+                  orderId,
+                  planId,
+                  orderCreatedAt,
+                  ticketError?.message
+                );
               }
             } catch (ticketError: any) {
-              fastify.log.error({ err: ticketError?.message, tgId, orderId }, '[Webhook] Failed to award tickets');
-              // Не прерываем процесс - оплата уже обработана
+              // Общая ошибка при работе с базой бота или начислением
+              fastify.log.error({ 
+                err: ticketError?.message,
+                stack: ticketError?.stack,
+                tgId, 
+                orderId 
+              }, '[Webhook] ❌ Error in ticket awarding flow (non-critical)');
+              
+              // Пытаемся добавить в очередь, если можем извлечь данные
+              try {
+                const orderCreatedAt = orderRow.created_at || new Date().toISOString();
+                awardRetryScheduler.addToRetryQueue(
+                  tgId,
+                  orderId,
+                  planId,
+                  orderCreatedAt,
+                  ticketError?.message
+                );
+              } catch (retryError) {
+                // Если не удалось добавить в очередь - просто логируем
+                fastify.log.warn({ err: retryError }, '[Webhook] Failed to add to retry queue');
+              }
             }
           }
 
